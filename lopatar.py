@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from pathlib import PurePath
-from datetime import timezone
+from datetime import timezone, datetime
 from time import time
 import os
 import logging
@@ -28,10 +28,11 @@ except ImportError:
 
 
 class Lopatar:
-    def __init__(self, token, api, ts_field,session=None):
+    def __init__(self, token, api, ts_field,alt_ts_field=None,session=None):
         self._token = token
         self._api = api
         self._ts_field=ts_field
+        self._alt_ts_field=alt_ts_field
         if session is None:
             self._session = str(uuid4())
 
@@ -46,16 +47,17 @@ class Lopatar:
             "token": self._token,
             "session": self._session,
             #FIXME - add some extraction of hostname from logs
-            "sessioninfo": {"serverHost": platform.node()},
+            "sessionInfo": {"serverHost": platform.node()},
             # "events": events
         }
         # LOGGER.debug(message,len(json.dumps(events)))
         message['events']=events
         LOGGER.debug(f"POST'ing {len(events)} events")
-        with open(r'C:\temp\example.json',"w") as f:
-            f.write(json.dumps(message))
-            import sys
-            sys.exit(-1)
+        # with open(r'C:\temp\example.json',"w") as f:
+        #      f.write(json.dumps(message))
+        #      import sys
+        #      sys.exit(-1)
+        start_time=datetime.now()
         r=requests.post(self._api,json=message)
         if r.status_code!=200:
             LOGGER.error(r,r.text)            
@@ -64,7 +66,8 @@ class Lopatar:
             jr=json.loads(r.text)
             if 'warnings' in jr:
                 LOGGER.warning(jr)
-        LOGGER.debug(f"{r},{r.text},{r.json()}")
+        end_time=datetime.now()
+        LOGGER.debug(f"{r},{r.text},{r.json()} in {end_time-start_time}")
 
     def upload_file(self, src):
 
@@ -79,9 +82,27 @@ class Lopatar:
             if buf_len + len(line) >= MAX_SIZE or line == "":
                 events=[]
                 for event_raw in buf:
+                    attrs_raw=json.loads(event_raw)
+                    attrs={}
+                    for k,v in attrs_raw.items():
+                        attrs[k.strip()]=v
+                        # if k.startswith(" ") or k.endswith(" "):
+                            # del attrs[k]
+                            # attrs[k.strip()]=v
+                        # attrs[k.strip()=attrs[v]
                     e = {
-                        'attrs': json.loads(event_raw)
+                        'attrs': attrs
                     }
+                    if self._alt_ts_field is not None:
+                        # if self._alt_ts_field not in e["attrs""]:
+                        #     print(e)
+                        #     sys.exit(-1)
+                        alt_ts=parse(e["attrs"][self._alt_ts_field])
+                        alt_ts_field_name=f"ts_{self._alt_ts_field}"
+                        e["attrs"][alt_ts_field_name]=str(
+                                int(alt_ts.timestamp()*1000000000)                                
+                                )
+                        assert len(e["attrs"][alt_ts_field_name])==19, "Badly formatted alt_ts"
                     if self._ts_field is not None:
                         if self._ts_field in e['attrs']:
                             ts = parse(e[self._ts_field])
@@ -91,11 +112,12 @@ class Lopatar:
                         else:
                             err = f"No ts field for line {i}"
                             LOGGER.debug(err)
-                            errors = append(err)
+                            errors.append(err)
                             e["ts"] = str(time.time_ns())
                     else:
                         e["ts"] = str(time.time_ns())
                     events.append(e)
+                    assert len(e["ts"])==19, "Badly formatted ts"
                 self.post_events(events)
                 buf = []
                 buf_len = 0
@@ -107,6 +129,7 @@ def main():
     parser = argparse.ArgumentParser(description="Shovel data into dataset")
     parser.add_argument("--token", metavar="DATASET_TOKEN", type=str)
     parser.add_argument("--ts-field", type=str)
+    parser.add_argument("--alt-ts-field", type=str,help="Field name which will be converted to epoch time but not used as the scalry ts")
     parser.add_argument("--local", action="store_true", default=False)
     parser.add_argument("source", nargs="?")
     parser.add_argument(
@@ -130,7 +153,7 @@ def main():
     )
 
     if args.local:
-        l=Lopatar(token,args.api,args.ts_field)
+        l=Lopatar(token,args.api,args.ts_field,args.alt_ts_field)
         l.upload_file(args.source)
     else:
         raise NotImplementedError
