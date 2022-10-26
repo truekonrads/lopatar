@@ -69,8 +69,50 @@ class Lopatar:
         end_time=datetime.now()
         LOGGER.debug(f"{r},{r.text},{r.json()} in {end_time-start_time}")
 
-    def upload_file(self, src):
+    def process_events(self,buf):
+        errors=[]
+        events=[]
+        for line_no,event_raw in buf:
+            attrs_raw=json.loads(event_raw)
+            attrs={}
+            for k,v in attrs_raw.items():
+                attrs[k.strip().replace(" ","-")]=v
+                # if k.startswith(" ") or k.endswith(" "):
+                    # del attrs[k]
+                    # attrs[k.strip()]=v
+                # attrs[k.strip()=attrs[v]
+            e = {
+                'attrs': attrs
+            }
+            if self._alt_ts_field is not None:
+                # if self._alt_ts_field not in e["attrs""]:
+                #     print(e)
+                #     sys.exit(-1)
+                alt_ts=parse(e["attrs"][self._alt_ts_field])
+                alt_ts_field_name=f"ts_{self._alt_ts_field}"
+                e["attrs"][alt_ts_field_name]=str(
+                        int(alt_ts.timestamp()*1000000000)                                
+                        )
+                assert len(e["attrs"][alt_ts_field_name])==19, "Badly formatted alt_ts for {line_no}"
+            if self._ts_field is not None:
+                if self._ts_field in e['attrs']:
+                    ts = parse(e[self._ts_field])
+                    e["ts"] = str(
+                        int(ts.timestamp()*1000000000)                                
+                        )
+                else:
+                    err = f"No ts field for line {line_no}"
+                    LOGGER.debug(f"{line_no}: {err}")
+                    errors.append(line_no,err)
+                    e["ts"] = str(time.time_ns())
+            else:
+                e["ts"] = str(time.time_ns())
+            events.append(e)
+            assert len(e["ts"])==19, "Badly formatted ts"
+        self.post_events(events)
+        return errors
 
+    def upload_file(self, src):
         fp = open(src, encoding="utf-8", errors="ignore")
         errors = []
         buf = []
@@ -80,49 +122,13 @@ class Lopatar:
             line_no += 1
             line = fp.readline()            
             if buf_len + len(line) >= MAX_SIZE or line == "":
-                events=[]
-                for event_raw in buf:
-                    attrs_raw=json.loads(event_raw)
-                    attrs={}
-                    for k,v in attrs_raw.items():
-                        attrs[k.strip()]=v
-                        # if k.startswith(" ") or k.endswith(" "):
-                            # del attrs[k]
-                            # attrs[k.strip()]=v
-                        # attrs[k.strip()=attrs[v]
-                    e = {
-                        'attrs': attrs
-                    }
-                    if self._alt_ts_field is not None:
-                        # if self._alt_ts_field not in e["attrs""]:
-                        #     print(e)
-                        #     sys.exit(-1)
-                        alt_ts=parse(e["attrs"][self._alt_ts_field])
-                        alt_ts_field_name=f"ts_{self._alt_ts_field}"
-                        e["attrs"][alt_ts_field_name]=str(
-                                int(alt_ts.timestamp()*1000000000)                                
-                                )
-                        assert len(e["attrs"][alt_ts_field_name])==19, "Badly formatted alt_ts"
-                    if self._ts_field is not None:
-                        if self._ts_field in e['attrs']:
-                            ts = parse(e[self._ts_field])
-                            e["ts"] = str(
-                                int(ts.timestamp()*1000000000)                                
-                                )
-                        else:
-                            err = f"No ts field for line {i}"
-                            LOGGER.debug(err)
-                            errors.append(err)
-                            e["ts"] = str(time.time_ns())
-                    else:
-                        e["ts"] = str(time.time_ns())
-                    events.append(e)
-                    assert len(e["ts"])==19, "Badly formatted ts"
-                self.post_events(events)
+                # LOGGER.debug(f"Buflen in {len(buf)}")
+                err=self.process_events(buf)
+                errors.append(err)
                 buf = []
                 buf_len = 0
             else:
-                buf.append(line)
+                buf.append((line_no,line))
                 buf_len += len(line)
 
 def main():
