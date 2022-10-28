@@ -32,7 +32,7 @@ except ImportError:
 
 
 class Lopatar:
-    def __init__(self, token, api, ts_field,alt_ts_field=None,session=None,progresss_bar=True):
+    def __init__(self, token, api, ts_field=None,alt_ts_field=None,session=None,progresss_bar=False):
         self._token = token
         self._api = api
         self._ts_field=ts_field
@@ -169,7 +169,8 @@ class Lopatar:
             for buf in self.read_chunks(src):                        
                 buf_len=sum(len(x[1]) for x in buf)
                 q.put(buf)
-                pbar.update(buf_len)
+                if self._progress_bar:
+                    pbar.update(buf_len)
             while not q.empty():
                 time.sleep(1)
             die_event.set() # signal workers to quit
