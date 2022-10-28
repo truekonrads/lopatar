@@ -12,15 +12,16 @@ from smart_open import open
 from dateutil.parser import parse
 import requests
 import time
-from tqdm.auto import tqdm
 from urllib.parse import urlparse
 import boto3
+import queue 
+import threading
 logging.basicConfig(
     format="%(asctime)s | %(name)-12s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
 LOGGER = logging.getLogger("lopatar")
-MAX_SIZE = 5 * 1024 * 1024  # Five and a half megs; limit is 6 megs
+MAX_SIZE = 4 * 1024 * 1024  # Four and a half megs; limit is 6 megs
 try:
     import ujson as json
 except ImportError:
@@ -31,23 +32,23 @@ except ImportError:
 
 
 class Lopatar:
-    def __init__(self, token, api, ts_field,alt_ts_field=None,session=None,threads=10,progresss_bar=True):
+    def __init__(self, token, api, ts_field,alt_ts_field=None,session=None,progresss_bar=True):
         self._token = token
         self._api = api
         self._ts_field=ts_field
         self._alt_ts_field=alt_ts_field
-        self._threads=threads
         self._progress_bar=progresss_bar
 
         if session is None:
             self._session = str(uuid4())
+        self.stats=[]
 
     @backoff.on_exception(
         backoff.expo,
                       requests.exceptions.RequestException,
                       max_time=300,
                       giveup=lambda e:e.response.status_code!=429,
-                      on_backoff= lambda details: LOGGER.debug("Backoff: {details}")
+                      on_backoff= lambda details: LOGGER.info("Backoff: {details}")
     )
     def post_events(self,events):
         message = {
@@ -74,7 +75,12 @@ class Lopatar:
             if 'warnings' in jr:
                 LOGGER.warning(jr)
         end_time=datetime.now()
-        LOGGER.debug(f"{r},{r.text},{r.json()} in {end_time-start_time}")
+        time_spent=end_time-start_time
+        self.stats.append(
+            (start_time,end_time,len(str(message)))
+        )        
+        LOGGER.debug(f"{r},{r.text},{r.json()} in {time_spent}")
+        #FIXME: right now no errors are returned
 
     def process_events(self,buf):
         errors=[]
@@ -120,6 +126,62 @@ class Lopatar:
         return errors
 
 
+    
+
+    def _worker(self,q,errors,die_event):
+        while True:
+            if die_event.is_set():
+                LOGGER.debug("Received die event, exiting")
+                return
+            try:
+                buf=q.get_nowait()                
+            except queue.Empty:
+                LOGGER.debug(f"{threading.get_ident()}: queue empty, sleeping")
+                #Skip a beat if queue is empty
+                time.sleep(1)
+                continue
+            try:
+                err=self.process_events(buf)
+                errors.append(err)            
+            except Exception as e:
+                LOGGER.error(f"Exception in {threading.get_ident()}: {e}")
+                raise
+            finally:
+                q.task_done()
+            
+
+    def upload_file_threads(self,src,thread_count=10):
+        
+        q = queue.Queue(maxsize=2*thread_count)
+        die_event = threading.Event()       
+
+        errors = []
+
+        if self._progress_bar:
+            from tqdm.auto import tqdm
+            pbar=tqdm(total=self._get_file_size(src),unit='B',unit_scale=True)
+        try:
+            threads = [threading.Thread(target=self._worker, args=[q,errors,die_event], daemon=True)
+            for _ in range(thread_count)]
+            for t in threads:
+                t.start()
+
+            for buf in self.read_chunks(src):                        
+                buf_len=sum(len(x[1]) for x in buf)
+                q.put(buf)
+                pbar.update(buf_len)
+            while not q.empty():
+                time.sleep(1)
+            die_event.set() # signal workers to quit
+            for t in threads:  # wait until workers exit
+                t.join()        
+        except KeyboardInterrupt:
+                    print("Ctrl+C pressed...")
+                    die_event.set()  # notify the child thread to exit
+                    # sys.exit(1)
+        return errors
+
+
     def upload_file(self, src):        
         if self._progress_bar:
             pbar=tqdm(total=self._get_file_size(src),unit='B',unit_scale=True)
@@ -162,18 +224,26 @@ class Lopatar:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Shovel data into dataset")
-    parser.add_argument("--token", metavar="DATASET_TOKEN", type=str)
-    parser.add_argument("--ts-field", type=str)
-    parser.add_argument("--alt-ts-field", type=str,help="Field name which will be converted to epoch time but not used as the scalry ts")
-    parser.add_argument("--local", action="store_true", default=False)
-    parser.add_argument("--debug", action="store_true",default=False)
-    parser.add_argument("source", nargs="?")
+    parser = argparse.ArgumentParser(description="Shovel data into dataset/scalyr")
+    parser.add_argument("--token", metavar="DATASET_TOKEN", type=str,
+    help="Dataset/Scalyr API token")
+    parser.add_argument("--ts-field", type=str, help="Timestamp field name, will be converted to \"ts\"")
+    parser.add_argument("--alt-ts-field", type=str,help="Field name which will additionally be converted to epoch time (not to be confused with ts field)")
+    parser.add_argument("--debug", action="store_true",default=False,
+    help="Enable debugging mode")
+    parser.add_argument("source",metavar="FILE",
+    help="File path of s3 URI for file to import")
     parser.add_argument(
-        "--api", type=str, default="https://app.scalyr.com/api/addEvents"
+        "--api", type=str, default="https://app.scalyr.com/api/addEvents",
+        help='Scalyr/DataSet API endpoint'
     )
-    parser.add_argument('--threads','-t',default=10,type=int,
+    parser.add_argument('--threads','-t',default=1,type=int,
         help="Set the number of worker threads")
+    
+    parser.add_argument("--plot",action="store_true",default=False,
+    help="Plot a nice performance chart!")
+    parser.add_argument("--progress-bar",action="store_true",default=False,
+    help="Display a progress bar")
     args = parser.parse_args()
     if args.debug:
         loglevel = getattr(logging, "DEBUG")
@@ -187,16 +257,29 @@ def main():
             print("Missing DATASET TOKEN")
             parser.print_usage()
             return
-    LOGGER.info(
-        f"Welcome to the lopatar, operating in {['aws','local'][int(args.local)]} mode"
-    )
 
-    if args.local:
-        l=Lopatar(token,args.api,args.ts_field,args.alt_ts_field,threads=args.threads)
-        l.upload_file(args.source)
+    
+    l_start_time=datetime.now()
+    l=Lopatar(token,args.api,args.ts_field,args.alt_ts_field,progresss_bar=args.progress_bar)
+    if args.threads>1:
+        l.upload_file_threads(args.source,args.threads)
     else:
-        raise NotImplementedError
-
+        l.upload_file(args.source)
+    ticks=[
+        (x[1]-l_start_time).seconds for x in l.stats
+    ]
+    values=[
+        (x[1]-x[0]).seconds for x in l.stats
+    ]
+    if args.plot:
+        # print(list(zip(ticks,values)))
+        import plotext as plt
+        plt.plot(ticks,values)
+        plt.title(f"Started at {l_start_time}")
+        plt.xlabel("Time in seconds since start")
+        plt.ylabel("Time in seconds to post")
+        plt.show()
+    
 
 if __name__ == "__main__":
     main()

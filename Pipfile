@@ -10,6 +10,7 @@ ujson = "*"
 python-dateutil = "*"
 requests = "*"
 tqdm = "*"
+plotext = "*"
 
 [dev-packages]
 black = "*"
