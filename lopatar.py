@@ -12,6 +12,9 @@ from smart_open import open
 from dateutil.parser import parse
 import requests
 import time
+from tqdm.auto import tqdm
+from urllib.parse import urlparse
+import boto3
 logging.basicConfig(
     format="%(asctime)s | %(name)-12s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S%z",
@@ -28,11 +31,14 @@ except ImportError:
 
 
 class Lopatar:
-    def __init__(self, token, api, ts_field,alt_ts_field=None,session=None):
+    def __init__(self, token, api, ts_field,alt_ts_field=None,session=None,threads=10,progresss_bar=True):
         self._token = token
         self._api = api
         self._ts_field=ts_field
         self._alt_ts_field=alt_ts_field
+        self._threads=threads
+        self._progress_bar=progresss_bar
+
         if session is None:
             self._session = str(uuid4())
 
@@ -40,7 +46,8 @@ class Lopatar:
         backoff.expo,
                       requests.exceptions.RequestException,
                       max_time=300,
-                      giveup=lambda e:e.response.status_code!=429
+                      giveup=lambda e:e.response.status_code!=429,
+                      on_backoff= lambda details: LOGGER.debug("Backoff: {details}")
     )
     def post_events(self,events):
         message = {
@@ -112,9 +119,20 @@ class Lopatar:
         self.post_events(events)
         return errors
 
-    def upload_file(self, src):
-        fp = open(src, encoding="utf-8", errors="ignore")
+
+    def upload_file(self, src):        
+        if self._progress_bar:
+            pbar=tqdm(total=self._get_file_size(src),unit='B',unit_scale=True)
         errors = []
+        for buf in self.read_chunks(src):                        
+            buf_len=sum(len(x[1]) for x in buf)
+            err=self.process_events(buf)
+            errors.append(err)
+            pbar.update(buf_len)
+        return errors
+    
+    def read_chunks(self, src):
+        fp = open(src, encoding="utf-8", errors="ignore")
         buf = []
         buf_len = 0
         line_no = 0
@@ -123,13 +141,25 @@ class Lopatar:
             line = fp.readline()            
             if buf_len + len(line) >= MAX_SIZE or line == "":
                 # LOGGER.debug(f"Buflen in {len(buf)}")
-                err=self.process_events(buf)
-                errors.append(err)
+                yield buf
                 buf = []
-                buf_len = 0
+                buf_len = 0                
+                # We've reached the end of file
+                if line == "": 
+                    break
             else:
                 buf.append((line_no,line))
                 buf_len += len(line)
+
+    def _get_file_size(self,filepath)->int:
+        if filepath.startswith("s3://"):
+            session=boto3.Session()
+            p=urlparse(filepath)                    
+            total=session.resource('s3').Object(p.netloc,p.path[1:]).content_length
+        else:
+            total=os.path.getsize(filepath)
+        return total
+
 
 def main():
     parser = argparse.ArgumentParser(description="Shovel data into dataset")
@@ -137,15 +167,18 @@ def main():
     parser.add_argument("--ts-field", type=str)
     parser.add_argument("--alt-ts-field", type=str,help="Field name which will be converted to epoch time but not used as the scalry ts")
     parser.add_argument("--local", action="store_true", default=False)
+    parser.add_argument("--debug", action="store_true",default=False)
     parser.add_argument("source", nargs="?")
     parser.add_argument(
         "--api", type=str, default="https://app.scalyr.com/api/addEvents"
     )
+    parser.add_argument('--threads','-t',default=10,type=int,
+        help="Set the number of worker threads")
     args = parser.parse_args()
-    loglevel = getattr(logging, "DEBUG")
-    LOGGER.setLevel(loglevel)
+    if args.debug:
+        loglevel = getattr(logging, "DEBUG")
+        LOGGER.setLevel(loglevel)
     
-
     if args.token:
         token = args.token
     else:
@@ -159,7 +192,7 @@ def main():
     )
 
     if args.local:
-        l=Lopatar(token,args.api,args.ts_field,args.alt_ts_field)
+        l=Lopatar(token,args.api,args.ts_field,args.alt_ts_field,threads=args.threads)
         l.upload_file(args.source)
     else:
         raise NotImplementedError
