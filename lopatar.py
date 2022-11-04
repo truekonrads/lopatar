@@ -86,7 +86,11 @@ class Lopatar:
         errors=[]
         events=[]
         for line_no,event_raw in buf:
-            attrs_raw=json.loads(event_raw)
+            try:
+                attrs_raw=json.loads(event_raw)
+            except json.JSONDecodeError as e:
+                LOGGER.error(f"Unable to parse line {line_no} due to {e}")
+                LOGGER.debug(f"{line_no}: `{event_raw}`")
             attrs={}
             for k,v in attrs_raw.items():
                 attrs[k.strip().replace(" ","-")]=v
