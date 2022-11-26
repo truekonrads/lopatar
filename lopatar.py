@@ -113,7 +113,7 @@ class Lopatar:
                 assert len(e["attrs"][alt_ts_field_name])==19, "Badly formatted alt_ts for {line_no}"
             if self._ts_field is not None:
                 if self._ts_field in e['attrs']:
-                    ts = parse(e[self._ts_field])
+                    ts = parse(e['attrs'][self._ts_field])
                     e["ts"] = str(
                         int(ts.timestamp()*1000000000)                                
                         )
