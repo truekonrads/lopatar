@@ -68,7 +68,7 @@ class Lopatar:
         start_time=datetime.now()
         r=requests.post(self._api,json=message)
         if r.status_code!=200:
-            LOGGER.error(r,r.text)            
+            LOGGER.error(f"{r}: {r.text}")            
         r.raise_for_status()
         if r.text.startswith("{"):
             jr=json.loads(r.text)
